@@ -1,0 +1,915 @@
+from __future__ import annotations
+
+import unittest
+from unittest.mock import patch
+
+from system import refinement_guard as guard
+from system.numeric_normalizer import ContextualNumericNormalizer
+from system.refinement_guard import (
+    apply_repetition_review_decisions,
+    detect_boundary_anomalies,
+    find_model_proposed_deletions,
+    find_repetition_review_candidates,
+    has_complete_repetition_review_context,
+    has_repetition_review_candidate,
+    join_refined_segments,
+    preserve_terminal_punctuation,
+    permits_self_correction_punctuation_repair,
+    preserve_safe_numeric_edits,
+    preserve_safe_repetition_edits,
+    repetition_decisions_from_text_response,
+    reject_reasons,
+    restore_rule_numeric_surfaces,
+    source_punctuation_lost,
+    split_for_refinement,
+    validate_boundary_repair,
+)
+
+
+class RefinementGuardTest(unittest.TestCase):
+    def test_batched_numeric_clause_identities_match_individual_parsing(self) -> None:
+        examples = (
+            "我是11，我是11。",
+            "我是11，我是12。",
+            "我有2000多个，我有2000多个。",
+            "我有两千多个，我有2000多个。",
+            "他有3万立方米；他有3万立方米！他有3万立方米。",
+            "金额为1,000元，金额为1,000元。",
+            "数值是3.5，数值是3.5。",
+            "比例为50%，比例为50%。",
+            "第一句没有数值，后面是11岁，后面是11岁。",
+            " ，；我有11个\n我有11个",
+            "普通文字。没有数值。",
+            "",
+        )
+        for source in examples:
+            with self.subTest(source=source):
+                clauses = guard._punctuation_clause_parts(source)
+                expected = tuple(
+                    guard._numeric_clause_identity(source, start, end)
+                    for start, end, _boundary in clauses
+                )
+                self.assertEqual(
+                    guard._numeric_clause_identities(source, clauses), expected
+                )
+                expected_pairs = [
+                    (left[0], right[2])
+                    for left, right, a, b in zip(
+                        clauses, clauses[1:], expected, expected[1:]
+                    )
+                    if a is not None and a == b
+                ]
+                self.assertEqual(
+                    [(span[0], span[1]) for span in guard._numeric_clause_repetition_spans(source)],
+                    expected_pairs,
+                )
+
+    def test_numeric_repetition_detection_parses_full_text_once(self) -> None:
+        source = "我有11个，我有11个。" * 40
+        with patch.object(
+            guard, "_numeric_mentions", wraps=guard._numeric_mentions
+        ) as parser:
+            self.assertTrue(guard.has_numeric_clause_repetition(source))
+        self.assertEqual(parser.call_count, 1)
+
+        identity = guard._numeric_clause_identity(source, 0, 5)
+        with patch.object(
+            guard, "_numeric_mentions", wraps=guard._numeric_mentions
+        ) as parser:
+            self.assertEqual(
+                guard._numeric_clause_occurrence_count(source, identity), 80
+            )
+        self.assertEqual(parser.call_count, 1)
+
+    def test_rejected_model_edit_exposes_only_standalone_deletion(self) -> None:
+        source = "呃，春秋晚年晚期嘛，所以礼坏乐崩嘛，"
+        proposed = "春秋晚期嘛，所以礼崩嘛。"
+        self.assertEqual(reject_reasons(source, proposed), ("semantic_content_loss",))
+        candidates = find_model_proposed_deletions(source, proposed)
+        self.assertEqual([(item.source, item.target) for item in candidates], [("呃，", "")])
+        self.assertEqual(find_model_proposed_deletions("这是一句完整的话。", "这是完整的话。"), ())
+
+    def test_default_refinement_segments_are_at_most_eighty_characters(self) -> None:
+        source = "这是一句需要完整保留的转录文本。" * 12
+        parts = split_for_refinement(source)
+
+        self.assertEqual(join_refined_segments(parts), source)
+        self.assertTrue(all(len(part) <= 80 for part in parts))
+
+    def test_one_punctuation_window_splits_commas_and_sentence_marks(self) -> None:
+        source = "第一段，第二段。第三段！第四段？"
+        parts = split_for_refinement(
+            source, one_punctuation_window=True
+        )
+
+        self.assertEqual(
+            parts, ("第一段，", "第二段。", "第三段！", "第四段？")
+        )
+        self.assertEqual(join_refined_segments(parts), source)
+
+    def test_decimal_points_do_not_create_windows_or_spaces(self) -> None:
+        source = "4.5万条、45.22米、2.6个、1.7亿。"
+        parts = split_for_refinement(source, one_punctuation_window=True)
+        self.assertEqual(join_refined_segments(parts), source)
+        self.assertEqual(parts, (source,))
+
+    def test_enumeration_comma_stays_inside_refinement_window(self) -> None:
+        source = (
+            "中国大地上，大自然和人类共同创造的江河纵横交织，"
+            "共同编织出一张互相连通、互相补给的水系网络，这就是国家水网。"
+        )
+        self.assertEqual(
+            split_for_refinement(source, one_punctuation_window=True),
+            (
+                "中国大地上，",
+                "大自然和人类共同创造的江河纵横交织，",
+                "共同编织出一张互相连通、互相补给的水系网络，",
+                "这就是国家水网。",
+            ),
+        )
+        self.assertTrue(
+            source_punctuation_lost(
+                "互相连通、互相补给的水系网络，",
+                "互相连通互相补给的水系网络，",
+            )
+        )
+
+    def test_sentence_preferred_split_preserves_source(self) -> None:
+        source = "第一句需要保留。第二句也需要保留，而且内容稍长。第三句结束。第四句继续说明，确保文本超过分段长度。"
+        parts = split_for_refinement(source, max_chars=32)
+
+        self.assertEqual(join_refined_segments(parts), source)
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(len(part) <= 32 for part in parts))
+
+    def test_refiner_cannot_drop_source_window_punctuation(self) -> None:
+        self.assertEqual(
+            preserve_terminal_punctuation("第一段，", "第一段"),
+            "第一段，",
+        )
+        self.assertEqual(
+            preserve_terminal_punctuation("第二段。", "第二段"),
+            "第二段。",
+        )
+        self.assertEqual(
+            preserve_terminal_punctuation("疑问？！", "疑问！"),
+            "疑问？！",
+        )
+
+    def test_source_punctuation_loss_is_detected_for_multi_block_window(self) -> None:
+        self.assertTrue(
+            source_punctuation_lost("第一段，第二段。第三段！", "第一段第二段第三段！")
+        )
+        self.assertFalse(
+            source_punctuation_lost("第一段，第二段。第三段！", "第一段，第二段。第三段！")
+        )
+
+    def test_self_correction_may_drop_abandoned_prefix_punctuation(self) -> None:
+        self.assertTrue(
+            permits_self_correction_punctuation_repair(
+                "我有一个苹果。不对，我有一个香蕉，还是有问题。",
+                "我有1个香蕉，还是有问题。",
+            )
+        )
+        self.assertTrue(
+            permits_self_correction_punctuation_repair(
+                "然后我有一箱苹果，嗯，不对我有一箱梨。",
+                "然后我有1箱梨。",
+            )
+        )
+
+    def test_self_correction_may_not_drop_retained_tail_punctuation(self) -> None:
+        self.assertFalse(
+            permits_self_correction_punctuation_repair(
+                "我有一个苹果。不对，我有一个香蕉，还是有问题。",
+                "我有1个香蕉。",
+            )
+        )
+
+    def test_boundary_anomaly_detector_excludes_lexical_continuations(self) -> None:
+        anomalies = detect_boundary_anomalies("三番五次的。的提醒就不太好了")
+        self.assertEqual(len(anomalies), 1)
+        self.assertEqual(anomalies[0].public_dict()["pattern"], "的。的")
+        self.assertEqual(detect_boundary_anomalies("是的。的确如此。"), ())
+        self.assertEqual(
+            detect_boundary_anomalies("这个方案很好。了不起的是，它很快。"), ()
+        )
+
+    def test_safe_boundary_repair_requires_local_anomaly_and_deletion_only(self) -> None:
+        self.assertTrue(
+            validate_boundary_repair(
+                "三番五次的。的提醒",
+                "三番五次的提醒",
+                "boundary_punctuation",
+            )
+        )
+        self.assertFalse(
+            validate_boundary_repair(
+                "第一段，第二段。",
+                "第一段第二段",
+                "boundary_punctuation",
+            )
+        )
+        self.assertFalse(
+            validate_boundary_repair(
+                "三番五次的。的提醒",
+                "三番五次的新的提醒",
+                "boundary_punctuation",
+            )
+        )
+
+    def test_unfinished_source_does_not_gain_punctuation(self) -> None:
+        self.assertEqual(
+            preserve_terminal_punctuation("未结束的片段", "未结束的片段"),
+            "未结束的片段",
+        )
+
+    def test_repeated_generated_sentence_is_rejected(self) -> None:
+        raw = "请说明当前情况，然后等待进一步通知。"
+        repeated = "请说明当前情况。" * 4
+
+        self.assertIn("repeated_sentence", reject_reasons(raw, repeated))
+
+    def test_truncated_long_complete_source_is_rejected(self) -> None:
+        raw = "这是一个需要完整保留的长句。" * 12
+        refined = "这是一个不完整的输出"
+
+        self.assertIn("truncated_refiner_output", reject_reasons(raw, refined))
+
+    def test_punctuated_severe_content_loss_is_rejected(self) -> None:
+        raw = (
+            "怎么可能？你竟结成了元婴？此青火杖乃墨家的不夜之杖。"
+            "你这手段怎么比我还像我道？我记住你了。你认识这位道友？"
+            "此人就是我与你说过的那个黄风谷姓韩的，放肆！"
+            "韩道友已经是元婴修士，又岂会和你一般见识？"
+        )
+
+        self.assertIn("severe_content_loss", reject_reasons(raw, "你怎么拼？"))
+
+    def test_equivalent_numbered_choice_rewrite_is_accepted(self) -> None:
+        cases = (
+            (
+                "那我们就只有两个两种选择，一种是互利共赢，一种是你死我活。",
+                "那我们就只有两个选择：\n1. 互利共赢\n2. 你死我活",
+            ),
+            (
+                "我们有三个三类方案，一类是甲案，一类是乙案，一类是丙案。",
+                "我们有三个方案：\n1. 甲案\n2. 乙案\n3. 丙案",
+            ),
+        )
+        for raw, refined in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(reject_reasons(raw, refined), ())
+
+    def test_numbered_choice_rewrite_must_keep_every_option_in_order(self) -> None:
+        raw = "那我们就只有两个两种选择，一种是互利共赢，一种是你死我活。"
+        candidates = (
+            "那我们就只有两个选择：\n1. 互利共赢",
+            "那我们就只有两个选择：\n1. 你死我活\n2. 互利共赢",
+            "那我们就只有三个选择：\n1. 互利共赢\n2. 你死我活",
+            "那我们就只有两个选择：\n1. 互利共赢\n2. 共同退让",
+        )
+        for refined in candidates:
+            with self.subTest(refined=refined):
+                self.assertTrue(reject_reasons(raw, refined))
+
+    def test_normal_refinement_is_accepted(self) -> None:
+        self.assertEqual(
+            reject_reasons("今天有一个苹果，不对，有一个梨。", "今天有一个梨。"),
+            (),
+        )
+
+    def test_long_self_correction_is_not_content_loss(self) -> None:
+        raw = (
+            "请记录这段话，我有一个苹果，不对，我有一个梨。"
+            "这是后面的补充说明，请一并保留。"
+        )
+
+        self.assertNotIn(
+            "severe_content_loss",
+            reject_reasons(
+                raw,
+                "请记录这段话，我有一个梨。这是后面的补充说明，请一并保留。",
+            ),
+        )
+
+    def test_comma_after_self_correction_tail_is_not_content_loss(self) -> None:
+        raw = "你好，我有一个苹果，我有一个梨，不对，我有一个香蕉，我有两千一百三十五元。"
+
+        self.assertNotIn(
+            "severe_content_loss",
+            reject_reasons(raw, "你好，我有一个香蕉，我有2135元。"),
+        )
+
+    def test_numeric_value_change_is_rejected(self) -> None:
+        reasons = reject_reasons(
+            "我有两千一百三十五元。",
+            "我有两百三十五元。",
+        )
+        self.assertIn("numeric_value_mismatch", reasons)
+
+    def test_measured_range_keeps_both_endpoint_values(self) -> None:
+        source = "人们将大堤加高了一到两米。"
+        self.assertEqual(reject_reasons(source, "人们将大堤加高了1到2米。"), ())
+        self.assertIn(
+            "numeric_value_mismatch",
+            reject_reasons(source, "人们将大堤加高了1到3米。"),
+        )
+
+    def test_classifier_quantity_normalization_is_accepted(self) -> None:
+        self.assertEqual(
+            reject_reasons("我有五个苹果。", "我有5个苹果。"),
+            (),
+        )
+
+    def test_partially_converted_range_uses_source_numeric_fallback(self) -> None:
+        cases = (
+            ("人们将大堤加高了一到两米。", "人们将大堤加高了一到2米。", "人们将大堤加高了1到2米。"),
+            ("现场来了一到两个人。", "现场来了一到2个人。", "现场来了1到2个人。"),
+            ("门口站着三到四位同事。", "门口站着3到四位同事。", "门口站着3到4位同事。"),
+        )
+        normalizer = ContextualNumericNormalizer()
+        for source, partial, complete in cases:
+            with self.subTest(source=source):
+                self.assertIn("partial_numeric_range_conversion", reject_reasons(source, partial))
+                self.assertIsNone(preserve_safe_numeric_edits(source, partial))
+                self.assertEqual(normalizer.normalize(source).text, complete)
+                self.assertEqual(reject_reasons(source, complete), ())
+
+    def test_approximate_adjacent_digits_are_not_treated_as_range(self) -> None:
+        self.assertNotIn(
+            "partial_numeric_range_conversion",
+            reject_reasons("门口站着三四个人。", "门口站着三四个人。"),
+        )
+
+    def test_ambiguous_digit_run_conversion_is_rejected(self) -> None:
+        self.assertIn(
+            "numeric_value_mismatch",
+            reject_reasons("我有二三个人。", "我有23个人。"),
+        )
+
+    def test_positional_number_normalization_is_accepted(self) -> None:
+        self.assertEqual(
+            reject_reasons("他二十三岁。", "他23岁。"),
+            (),
+        )
+
+    def test_safe_numeric_normalization_is_accepted(self) -> None:
+        self.assertEqual(
+            reject_reasons(
+                "百分之五的概率，日期是二零一五年五月五日。",
+                "5%的概率，日期是2015年5月5日。",
+            ),
+            (),
+        )
+
+    def test_safe_numeric_edits_survive_unrelated_window_rejection(self) -> None:
+        raw = "我让他五个法器。再不行，我让他十个，怎么样啊？叶大侠，谭道友，谭道友。"
+        rejected_candidate = "我让他5个法器。再不行，我让他10个，怎么样啊？叶大侠，谭道友。"
+
+        self.assertEqual(
+            preserve_safe_numeric_edits(raw, rejected_candidate),
+            "我让他5个法器。再不行，我让他10个，怎么样啊？叶大侠，谭道友，谭道友。",
+        )
+
+    def test_safe_numeric_edit_survives_punctuation_loss_after_number(self) -> None:
+        raw = "再不行，我让他十个，怎么样啊？叶大侠，谭道友，谭道友，道爷知道天难比。"
+        rejected_candidate = "再不行，我让他10个怎么样啊？叶大侠，谭道友知道天难比。"
+
+        self.assertEqual(
+            preserve_safe_numeric_edits(raw, rejected_candidate),
+            "再不行，我让他10个，怎么样啊？叶大侠，谭道友，谭道友，道爷知道天难比。",
+        )
+
+    def test_unsafe_bare_numeral_edit_is_not_salvaged(self) -> None:
+        self.assertIsNone(
+            preserve_safe_numeric_edits("这件事不值一提。", "这件事不值1提。")
+        )
+
+    def test_semantic_deletions_are_rejected(self) -> None:
+        cases = (
+            (
+                "看，掘地三尺，要把他给我找出来！",
+                "看，掘地三尺，要把我找出来！",
+            ),
+            (
+                "你认识这位道友，二伯，此人就是我与你说过，那个黄风谷姓韩的。",
+                "你认识这位道友，伯，你我说过，黄风谷姓韩的。",
+            ),
+        )
+        for raw, refined in cases:
+            with self.subTest(raw=raw):
+                self.assertIn("semantic_content_loss", reject_reasons(raw, refined))
+
+    def test_semantic_particle_substitution_is_rejected(self) -> None:
+        self.assertIn(
+            "semantic_substitution",
+            reject_reasons("你当我傻？", "你当我的？"),
+        )
+
+    def test_repetition_cleanup_remains_allowed(self) -> None:
+        self.assertEqual(
+            reject_reasons(
+                "然后哈哈哈，我一五一十的告诉你。",
+                "然后我一五一十的告诉你。",
+            ),
+            (),
+        )
+        self.assertEqual(
+            reject_reasons(
+                "今天有一个苹果，不对，有一个梨。",
+                "今天有一个梨。",
+            ),
+            (),
+        )
+
+    def test_classifier_reduplication_requires_one_prefix(self) -> None:
+        self.assertEqual(
+            reject_reasons("首首先说明。", "首先说明。"),
+            (),
+        )
+        self.assertIn(
+            "semantic_content_loss",
+            reject_reasons("一首首歌。", "一首歌。"),
+        )
+
+    def test_repetition_edits_survive_unrelated_window_rejection(self) -> None:
+        raw = "又又从利义的角度选，初心嘛。"
+        rejected_candidate = "又从利义的角度选，初心吗。"
+
+        self.assertEqual(
+            preserve_safe_repetition_edits(raw, rejected_candidate),
+            "又从利义的角度选，初心嘛。",
+        )
+        self.assertIsNone(
+            preserve_safe_repetition_edits("一座座城市。", "一座城市。")
+        )
+
+    def test_adjacent_phrase_repetition_survives_unrelated_rejection(self) -> None:
+        raw = "我们我们就假设所有人都是为了利的。"
+        rejected = "我们就假设所有人都是为了义的。"
+        self.assertEqual(
+            preserve_safe_repetition_edits(raw, rejected),
+            "我们就假设所有人都是为了利的。",
+        )
+        self.assertEqual(
+            preserve_safe_repetition_edits(
+                "我们我们就假设所有人都是为了利的。",
+                "我们假设所有人都是为了义的。",
+            ),
+            "我们就假设所有人都是为了利的。",
+        )
+
+    def test_unsupported_single_character_deletions_are_rejected(self) -> None:
+        for raw, refined in (
+            ("所以这可能也是在人类历史上。", "所以这可能也在人类历史上。"),
+            ("只不过这个结果很好。", "不过这个结果很好。"),
+            ("人没有仁义。", "人有仁义。"),
+        ):
+            with self.subTest(raw=raw):
+                self.assertIn("semantic_content_loss", reject_reasons(raw, refined))
+
+    def test_repetition_review_candidates_are_structural(self) -> None:
+        candidates = find_repetition_review_candidates(
+            "首首先说明，引引入一个假假设，那人人性到底是什么？一首首歌。"
+        )
+        self.assertEqual(
+            [candidate.source for candidate in candidates],
+            ["首首", "引引", "假假", "人人"],
+        )
+
+    def test_fast_repetition_presence_check_matches_full_candidate_search(self) -> None:
+        examples = (
+            "首首先说明，引引入一个假假设，那人人性到底是什么？一首首歌。",
+            "模拟普通人接到警察电话：‘喂，喂，是郭庆子。你，你先听我说。啊！啊。’",
+            "我是11，我是11。",
+            "人人平等，今天讨论江河治理。",
+            "这是一段没有重复候选的普通转录文本。",
+        )
+        for source in examples:
+            for numeric_rule_mode in (False, True):
+                with self.subTest(
+                    source=source, numeric_rule_mode=numeric_rule_mode
+                ):
+                    expected = bool(find_repetition_review_candidates(
+                        source, numeric_rule_mode=numeric_rule_mode
+                    ))
+                    self.assertEqual(
+                        has_repetition_review_candidate(
+                            source, numeric_rule_mode=numeric_rule_mode
+                        ),
+                        expected,
+                    )
+
+    def test_punctuated_repetition_review_candidates_are_structural(self) -> None:
+        candidates = find_repetition_review_candidates(
+            "模拟普通人接到警察电话：‘喂，喂，是郭庆子。你，你先听我说。啊！啊，别急。喂。喂。你：你。啊…啊。’"
+        )
+        self.assertEqual(
+            [candidate.source for candidate in candidates],
+            ["喂，喂", "你，你", "啊！啊", "喂。喂", "你：你", "啊…啊"],
+        )
+        self.assertTrue(
+            all(candidate.kind == "punctuated_run" for candidate in candidates)
+        )
+
+    def test_repetition_review_uses_five_sentences_and_waits_for_following_context(self) -> None:
+        complete = "第一句。第二句。候选人人性。第四句。第五句。第六句。"
+        candidate = next(
+            item for item in find_repetition_review_candidates(complete)
+            if item.source == "人人"
+        )
+        self.assertEqual(
+            candidate.context,
+            "第一句。第二句。候选人人性。第四句。第五句。",
+        )
+        self.assertTrue(has_complete_repetition_review_context(complete, candidate))
+
+        incomplete = "第一句。第二句。候选人人性。第四句。"
+        incomplete_candidate = next(
+            item for item in find_repetition_review_candidates(incomplete)
+            if item.source == candidate.source
+        )
+        self.assertFalse(
+            has_complete_repetition_review_context(incomplete, incomplete_candidate)
+        )
+
+    def test_punctuated_repetition_deletion_passes_local_guard(self) -> None:
+        self.assertEqual(
+            reject_reasons("喂，喂，是郭庆子是吧？", "喂，是郭庆子是吧？"),
+            (),
+        )
+        source = "模拟普通人接到警察电话：‘喂，喂，是郭庆子是吧？’"
+        candidates = find_repetition_review_candidates(source)
+        repaired, reviews = apply_repetition_review_decisions(
+            source,
+            candidates,
+            [{"index": 1, "action": "remove", "reason": "speech repetition"}],
+        )
+        self.assertEqual(
+            repaired,
+            "模拟普通人接到警察电话：‘喂，是郭庆子是吧？’",
+        )
+        self.assertTrue(reviews[0]["applied"])
+
+    def test_repetition_review_applies_only_selected_spans(self) -> None:
+        source = "首首先说明，引引入一个假假设。"
+        candidates = find_repetition_review_candidates(source)
+        repaired, reviews = apply_repetition_review_decisions(
+            source,
+            candidates,
+            [
+                {"index": 1, "action": "remove", "reason": "speech repetition"},
+                {"index": 2, "action": "keep", "reason": "uncertain"},
+                {"index": 3, "action": "remove", "reason": "speech repetition"},
+            ],
+        )
+        self.assertEqual(repaired, "首先说明，引引入一个假设。")
+        self.assertEqual(
+            [review["decision"] for review in reviews],
+            ["remove", "keep", "remove"],
+        )
+
+    def test_model_selected_ambiguous_repetition_can_pass_local_guard(self) -> None:
+        source = "那人人性到底是什么呢？"
+        candidates = find_repetition_review_candidates(source)
+        repaired, reviews = apply_repetition_review_decisions(
+            source,
+            candidates,
+            [{"index": 1, "action": "remove", "reason": "model_local_review"}],
+        )
+        self.assertEqual(repaired, "那人性到底是什么呢？")
+        self.assertTrue(reviews[0]["applied"])
+
+    def test_legacy_repetition_review_accepts_candidate_deletions_only(self) -> None:
+        source = "首首先说明，引引入一个假假设。"
+        candidates = find_repetition_review_candidates(source)
+        decisions = repetition_decisions_from_text_response(
+            source,
+            candidates,
+            "首先说明，引引入一个假设。",
+        )
+        self.assertIsNotNone(decisions)
+        self.assertEqual(
+            [item["action"] for item in decisions or []],
+            ["remove", "keep", "remove"],
+        )
+        self.assertIsNone(
+            repetition_decisions_from_text_response(
+                source,
+                candidates,
+                "首先说明，引引入一个假设!",
+            )
+        )
+
+    def test_single_character_subject_cannot_be_replaced_by_new_phrase(self) -> None:
+        self.assertIn(
+            "unsupported_insertion",
+            reject_reasons(
+                "我让渡我的利益，你也让渡我的利益。",
+                "我让渡我的利益，同时也让渡我的利益。",
+            ),
+        )
+        self.assertIn(
+            "semantic_content_loss",
+            reject_reasons("当然，这些问题还有争议。", "哦，这些问题还有争议。"),
+        )
+        self.assertIn(
+            "semantic_substitution",
+            reject_reasons("当然，这些问题还有争议。", "哦对了，这些问题还有争议。"),
+        )
+
+    def test_single_character_boundary_echo_deletion_is_allowed(self) -> None:
+        self.assertEqual(
+            reject_reasons(
+                "你。你竟结成了元婴，厌恶力有多？",
+                "你竟结成了元婴，厌恶力有多？",
+            ),
+            (),
+        )
+
+    def test_repeated_content_insertion_is_rejected(self) -> None:
+        self.assertIn(
+            "unsupported_insertion",
+            reject_reasons(
+                "随便你们进来打打杀杀，快给我滚！你听见了，我是不会跟你打的。",
+                "随便你们进来杀杀，快给我滚！你听见了，我是不会跟你打杀杀的。",
+            ),
+        )
+
+    def test_unjustified_content_insertion_is_rejected(self) -> None:
+        self.assertIn(
+            "unsupported_insertion",
+            reject_reasons(
+                "共同编织出1张互相连通、互相补给的水系网络",
+                "共同编织出1张互相连通的东西、互相补给的水系网络",
+            ),
+        )
+
+    def test_reduplication_loss_is_rejected(self) -> None:
+        for raw, refined in (
+            ("一座座绿洲城市。", "一座绿洲城市。"),
+            ("一朵朵云，一层层山。", "一朵云，一层山。"),
+            ("一艘艘船，一本本书。", "一艘船，一本书。"),
+            ("一串串灯，一群群人。", "一串灯，一群人。"),
+            ("一蓬蓬雾。", "一蓬雾。"),
+            ("层层叠叠的山峦。", "层叠叠的山峦。"),
+            ("水汽源源不断地送入中国。", "水汽源不断地送入中国。"),
+            ("让大网生生不息地运转。", "让大网生不息地运转。"),
+        ):
+            with self.subTest(raw=raw):
+                self.assertIn("semantic_content_loss", reject_reasons(raw, refined))
+
+    def test_negation_pattern_substitution_is_rejected(self) -> None:
+        self.assertIn(
+            "semantic_substitution",
+            reject_reasons("这里不只有悬挂的公路。", "这里不是有悬挂的公路。"),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class NumericValidationAlignmentTest(unittest.TestCase):
+    """Legal Chinese->Arabic numeric normalizations must pass the guard, while
+    real value changes must still be rejected."""
+
+    def test_legal_normalizations_are_accepted(self) -> None:
+        cases = (
+            ("晚上七点十分开会。", "晚上7点10分开会。"),
+            ("价格涨了一到两点五米。", "价格涨了1到2.5米。"),
+            ("有百分之十二点五的概率。", "有12.5%的概率。"),
+            ("今天是二零一五年十二月五日。", "今天是2015年12月5日。"),
+            ("进度是百分之五。", "进度是5%。"),
+            ("预算两千一百三十五元。", "预算2135元。"),
+            ("他今年三十岁。", "他今年30岁。"),
+            ("走了二十分钟。", "走了20分钟。"),
+            ("我让他五个法器；再不行，我让他十个，怎么样？", "我让他5个法器；再不行，我让他10个，怎么样？"),
+            ("下午三点半开会。", "下午3点半开会。"),
+            ("总共发生了两千多次。", "总共发生了2000多次。"),
+            ("相当于五十多座水库。", "相当于50多座水库。"),
+            ("连接了三千多个湖泊。", "连接了3000多个湖泊。"),
+            ("大约三百来人到场。", "大约300来人到场。"),
+            ("不到五十公里。", "不到50公里。"),
+            ("数量在三百左右。", "数量在300左右。"),
+            ("容量约六万立方米。", "容量约6万立方米。"),
+            ("这里有一点七亿人口。", "这里有1.7亿人口。"),
+        )
+        for raw, refined in cases:
+            with self.subTest(raw=raw, refined=refined):
+                reasons = reject_reasons(raw, refined)
+                self.assertNotIn("numeric_value_mismatch", reasons, reasons)
+                self.assertNotIn("severe_content_loss", reasons, reasons)
+
+    def test_real_value_changes_are_rejected(self) -> None:
+        cases = (
+            ("我有两千一百三十五元。", "我有两百三十五元。"),
+            ("我有百分之五的概率。", "我有百分之十五的概率。"),
+            ("今天是一月五日。", "今天是12月5日。"),
+        )
+        for raw, refined in cases:
+            with self.subTest(raw=raw, refined=refined):
+                self.assertIn(
+                    "numeric_value_mismatch", reject_reasons(raw, refined)
+                )
+
+    def test_numeric_context_loss_is_rejected_without_a_suffix_allowlist(self) -> None:
+        cases = (
+            ("相当于五十多座水库。", "相当于50座水库。"),
+            ("大约三百来人到场。", "大约300人到场。"),
+            ("水深四十五点二二米。", "水深45.2米。"),
+            ("这里有一点七亿人口。", "这里有1.7亿元人口。"),
+            ("相当于二点六个三峡。", "相当于2.6三峡。"),
+        )
+        for raw, refined in cases:
+            with self.subTest(raw=raw, refined=refined):
+                self.assertIn(
+                    "numeric_value_mismatch", reject_reasons(raw, refined)
+                )
+
+    def test_numeric_itn_inside_a_wider_edit_is_accepted(self) -> None:
+        # The pair is not numeric-surface-only because a self-correction
+        # removed a number-bearing false start.  The surviving numeric
+        # rewrite is still legal ITN and must not be flagged as semantic loss.
+        raw = "不对，我有一百二十三万五千四百三十一元。应该是二百万零五十元。"
+        self.assertEqual(reject_reasons(raw, "应该是2000050元。"), ())
+
+
+class MultiStageSelfCorrectionTest(unittest.TestCase):
+    """A multi-stage correction chain may collapse to its final clause even
+    when the refiner only sees the ITN-normalized surface (``一个`` -> ``1个``)."""
+
+    RAW = "你好，你好，我有一个苹果，不对，我有一个梨，不对，我有一个香蕉。"
+    RESOLVED = "你好，我有1个香蕉。"
+
+    def test_itn_normalized_correction_tail_is_accepted(self) -> None:
+        self.assertEqual(reject_reasons(self.RAW, self.RESOLVED), ())
+
+    def test_multi_stage_chain_keeps_working_with_sentence_punctuation(self) -> None:
+        raw = "你好，你好，我有一个苹果。不对，我有一个梨。不对，我有一个香蕉。"
+        self.assertEqual(reject_reasons(raw, "你好，我有1个香蕉。"), ())
+
+    def test_single_stage_correction_still_needs_a_reasonable_ratio(self) -> None:
+        # Only one correction marker: a deep collapse that keeps the tail is
+        # still reported as content loss instead of being silently accepted.
+        raw = "今天早上我在家里吃了一个苹果，不对，我吃了一个梨。"
+        reasons = reject_reasons(raw, "我吃了1个梨。")
+        self.assertIn("severe_content_loss", reasons)
+
+    def test_changed_number_in_correction_tail_is_still_rejected(self) -> None:
+        # Numeric normalization must stay value preserving: a real value
+        # change inside the retained tail is not a formatting difference.
+        reasons = reject_reasons("不对，我有五个梨。", "我有3个梨。")
+        self.assertIn("numeric_value_mismatch", reasons)
+
+    def test_dangling_correction_marker_does_not_hide_earlier_correction(self) -> None:
+        # A chunk boundary may leave ``不对，`` dangling at the end of a
+        # window.  That occurrence has no replacement clause, so the guard
+        # must fall back to the earlier complete self-correction instead of
+        # reporting the whole window as content loss.
+        raw = (
+            "你好，我有一个苹果。不对，我有一个梨。"
+            "今天是二零一五年十二月五日。"
+            "我有百分之三十七的概率会获得一百二十三万五千四百三十一元。不对，"
+        )
+        refined = (
+            "你好，我有1个梨。今天是2015年12月5日。"
+            "我有37%的概率会获得1235431元。"
+        )
+        self.assertEqual(reject_reasons(raw, refined), ())
+
+
+class NumericSelfCorrectionTest(unittest.TestCase):
+    """A numeric self-correction chain may collapse to the final value."""
+
+    RAW = (
+        "我有百分之三十七的概率在二零一五年十二月五日这天获得"
+        "一千二百三十四万五千四百三十一元。不对，应该是一百五十块。不对，应该是一百块。"
+    )
+
+    def test_numeric_correction_chain_collapses_to_final_value(self) -> None:
+        # The Refiner resolved the amount to ``100元``.  ``100块`` and
+        # ``100元`` are the same currency mention, and the superseded
+        # values are exactly what a self-correction discards.
+        self.assertEqual(
+            reject_reasons(
+                self.RAW,
+                "我有37%的概率在2015年12月5日这天获得100元。",
+            ),
+            (),
+        )
+
+    def test_invented_value_inside_a_correction_is_rejected(self) -> None:
+        reasons = reject_reasons(
+            "获得一千二百三十四万五千四百三十一元。不对，应该是一百块。",
+            "获得555元。应该是100块。",
+        )
+        self.assertIn("semantic_content_loss", reasons)
+
+    def test_unit_change_inside_a_correction_is_rejected(self) -> None:
+        reasons = reject_reasons(
+            "获得一千二百三十四万五千四百三十一元。不对，应该是一百块。",
+            "获得100个。应该是100块。",
+        )
+        self.assertIn("semantic_content_loss", reasons)
+
+
+class NumericRuleModeGuardTest(unittest.TestCase):
+    def test_rule_mode_restores_number_surface_and_keeps_safe_repetition_edit(self) -> None:
+        source = "我们我们将六十多万条沟谷送入河。"
+        model_text = "我们将60多万条沟谷送入河。"
+
+        repaired = restore_rule_numeric_surfaces(source, model_text)
+
+        self.assertEqual(repaired, "我们将六十多万条沟谷送入河。")
+        self.assertEqual(
+            reject_reasons(source, repaired, numeric_rule_mode=True), ()
+        )
+
+    def test_rule_mode_restores_approximate_number_in_long_sentence_cleanup(self) -> None:
+        source = (
+            "在水流的冲刷下，超过10亿吨泥沙沿着六十多万条沟谷，"
+            "源源不断地汇入黄河，"
+        )
+        model_text = (
+            "在水流的冲刷下，超过10亿吨泥沙沿着60多万条沟谷，"
+            "源源不断地汇入黄河。"
+        )
+
+        repaired = restore_rule_numeric_surfaces(source, model_text)
+
+        self.assertEqual(
+            repaired,
+            "在水流的冲刷下，超过10亿吨泥沙沿着六十多万条沟谷，"
+            "源源不断地汇入黄河。",
+        )
+        self.assertEqual(
+            reject_reasons(source, repaired, numeric_rule_mode=True), ()
+        )
+
+    def test_rule_mode_does_not_restore_an_unmatched_numeric_value(self) -> None:
+        self.assertIsNone(
+            restore_rule_numeric_surfaces("我今年11岁。", "我今年12岁。")
+        )
+
+    def test_numeric_clause_repeat_can_be_removed_after_model_review(self) -> None:
+        source = "我是11，我是11。"
+        self.assertEqual(
+            find_repetition_review_candidates(source), ()
+        )
+        self.assertEqual(
+            find_repetition_review_candidates(source, numeric_rule_mode=True)[0].kind,
+            "numeric_clause_repetition",
+        )
+        revised, records = apply_repetition_review_decisions(
+            source,
+            find_repetition_review_candidates(source, numeric_rule_mode=True),
+            [{"index": 1, "action": "remove", "reason": "repeated_clause"}],
+            numeric_rule_mode=True,
+        )
+        self.assertEqual(revised, "我是11。")
+        self.assertTrue(records[0]["applied"])
+        self.assertEqual(reject_reasons(source, revised, numeric_rule_mode=True), ())
+
+    def test_numeric_clause_repeat_cannot_change_the_retained_value(self) -> None:
+        reasons = reject_reasons(
+            "我是11，我是11。", "我是12。", numeric_rule_mode=True
+        )
+        self.assertIn("numeric_value_mismatch", reasons)
+
+    def test_rule_mode_locks_number_surface_after_itn(self) -> None:
+        source = "我有5个苹果。"
+        target = "我有五个苹果。"
+        self.assertEqual(reject_reasons(source, target), ())
+        self.assertIn(
+            "numeric_rule_surface_mismatch",
+            reject_reasons(source, target, numeric_rule_mode=True),
+        )
+
+    def test_explicit_numeric_correction_drops_only_false_start(self) -> None:
+        source = "我今天11岁，不对，我今天12岁。"
+        self.assertEqual(
+            reject_reasons(source, "我今天12岁。", numeric_rule_mode=True),
+            (),
+        )
+        self.assertIn(
+            "numeric_rule_surface_mismatch",
+            reject_reasons(source, "我今天十二岁。", numeric_rule_mode=True),
+        )
+        self.assertIn(
+            "numeric_value_mismatch",
+            reject_reasons(source, "我今天13岁。", numeric_rule_mode=True),
+        )
+
+    def test_numeric_correction_does_not_authorize_an_unrelated_number_change(self) -> None:
+        source = "妈妈50岁，我今天11岁，不对，我今天12岁。"
+        target = "妈妈51岁，我今天12岁。"
+        reasons = reject_reasons(source, target, numeric_rule_mode=True)
+        self.assertTrue(
+            {"numeric_value_mismatch", "numeric_rule_surface_mismatch"} & set(reasons),
+            reasons,
+        )
+
+if __name__ == "__main__":
+    unittest.main()

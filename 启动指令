@@ -1,0 +1,8 @@
+# 在当前仓库根目录运行：
+#   bash scripts/start_qwen_asr.sh
+#   bash scripts/start_web.sh
+#
+# 两个脚本会根据自身位置定位仓库，不依赖旧的 AgenticASR 目录名。
+# 也可以通过环境变量覆盖模型、GPU、端口和门控参数。
+
+# A/B 对比只改这一项：off=原始全量精修，conservative=启用保守门控。
